@@ -1,7 +1,0 @@
-
-local ok, m = pcall(require, "zjtab")
-if ok then
-  m.setup()
-  vim.api.nvim_create_user_command("ZJTabRefresh", function() m.refresh() end, { })
-end
-
