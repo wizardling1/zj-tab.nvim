@@ -1,4 +1,3 @@
-
 local M = {}
 
 local devicons_ok, devicons = pcall(require, "nvim-web-devicons")
