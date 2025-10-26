@@ -6,15 +6,16 @@
 </div>
 <br>
 
-A neovim plugin that automatically updates your [Zellij](https://zellij.dev) tab names 
+A Neovim plugin that automatically updates your [Zellij](https://zellij.dev) tab names 
 to match the active buffer.
 
 ## Features
 
-- Automatically renames the current Zellij tab when switching buffers, tabs, or terminals
+- Automatically renames the current Zellij tab when switching buffers, tabs, or terminals.
 - Optional [nvim-web-devicons](https://github.com/nvim-tree/nvim-web-devicons) support for 
-  file icons  
-- Preserves the pre-Neovim tab name and restores it on exit
+  file icons.
+- Preserves the pre-Neovim tab name and restores it on exin.
+- Detects when Neovim is run outside of Zellij, and if so, doesn't attempt to rename tabs.
 
 ## Installation
 
@@ -22,8 +23,9 @@ Requirements:
 
 - [Zellij](https://zellij.dev) ≥ 0.40
 - Neovim ≥ 0.8
-- (Optional) [nvim-web-devicons](https://github.com/nvim-tree/nvim-web-devicons) for icons  
-- A Nerd Font if using devicons
+- If using devicons:
+    - [nvim-web-devicons](https://github.com/nvim-tree/nvim-web-devicons) for icons  
+    - A Nerd Font 
 
 Using **lazy.nvim**:
 
