@@ -57,7 +57,7 @@ function M.setup()
   aug = vim.api.nvim_create_augroup("ZJTab", { clear = true })
   vim.api.nvim_create_autocmd(
     { "BufEnter", "BufFilePost", "BufWritePost", "TermEnter", "DirChanged", "FileType" },
-    { group = aug, callback = schedule_send, desc = "zjtab.nvim: update Zellij tab title" }
+    { group = aug, callback = schedule_send, desc = "zj-tab.nvim: update Zellij tab title" }
   )
   schedule_send()
 end
