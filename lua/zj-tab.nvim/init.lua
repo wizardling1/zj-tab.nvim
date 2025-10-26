@@ -1,8 +1,6 @@
 
 local M = {}
 
--- your existing code, unchanged except for wrapping in setup()/refresh()
-
 local devicons_ok, devicons = pcall(require, "nvim-web-devicons")
 local MULTI_ICON = ""
 
@@ -52,7 +50,6 @@ local function schedule_send()
     send_title()
   end, 5)
 end
--- ---------------------------
 
 local aug
 
