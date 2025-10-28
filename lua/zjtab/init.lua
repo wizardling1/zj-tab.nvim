@@ -1,4 +1,13 @@
 
+-- add directory name parsing
+--  - replace home with ~
+--  - add maximum directory depth
+--  - add github detection
+-- add more unified way to obtain plugins 
+--  - devicons of course
+--  - nvimtree, if not found continue quietly, 
+--      if not found and NvimTree buffer found, use [No Name] and dir icon
+
 local M = {}
 M.enabled = true
 
@@ -6,10 +15,13 @@ local Config = {
   max_tabname_width = 20,
   debounce_ms = 20,
   enable_devicons = true,
-  multi_icon = "",
-  default_icon = "",
+  icons = {
+    multi = "",
+    dir = "",
+    default = "",
+  },
   fallback_restored_tabname = "Tab",
-  debug = false,
+  debug = true,
 }
 
 local State = {
@@ -17,7 +29,11 @@ local State = {
   autocmd_group = nil,
   pending = false,
   last_set_tabname = nil,
-  original_name = { known = false, name = Config.fallback_restored_tabname }
+  original_name = { known = false, name = Config.fallback_restored_tabname },
+  loaded_plugins = {
+    devicons = nil,
+    nvimtree = nil,
+  },
 }
 
 -- --- Utilities ---
@@ -108,19 +124,19 @@ local function get_devicons_get_icon()
       vim.log.levels.WARN
     )
     return function(_, _, _)
-        return Config.default_icon
+        return Config.icons.default
     end
   end
 end
 
-local function prefix_devicon(str, get_icon)
-  if type(str) ~= "string" or str == "" then
-    return Config.default_icon
+local function prefix_devicon(str, icon)
+  if type(str) ~= "string" then
+    dlog("prefix_devicon: 'str' argument is supposed to be string, is instead " .. type(str))
+    return
+  elseif str == "" then
+    return icon
   else
-    local fname = vim.fn.fnamemodify(str, ":t")
-    local ext   = vim.fn.fnamemodify(fname, ":e")
-    local icon  = get_icon(fname, ext, { default = true })
-    return (icon or Config.default_icon) .. " " .. str
+    return icon .. " " .. str
   end
 end
 
@@ -151,7 +167,7 @@ local function truncate_name(name, max_width)
   end
 end
 
-local function buffer_name()
+local function get_cur_buffer_name()
   local name = vim.fn.expand("%:t")
   if name == "" then name = "[No Name]" end
   return name
@@ -160,7 +176,7 @@ end
 local function rename_tab_normal()
   local name =
     truncate_name(
-      buffer_name(),
+      get_cur_buffer_name(),
       Config.max_tabname_width
     )
 
@@ -171,14 +187,36 @@ local function rename_tab_normal()
 end
 
 local function rename_tab_devicons(get_icon)
+  local buffer_type = vim.bo.filetype
+
+  local buffer_name
+  local icon
+
+  if buffer_type == "netrw" then
+    icon = Config.icons.dir
+    buffer_name = vim.b.netrw_curdir
+  elseif buffer_type == "NvimTree" then
+    icon = Config.icons.dir
+    local ok, api = pcall(require, "nvim-tree.api")
+    if ok and api.tree.is_visible() then
+      buffer_name = api.tree.get_node_under_cursor().absolute_path
+    else
+      buffer_name = "failed"
+    end
+  else
+    buffer_name = get_cur_buffer_name()
+    local ext   = vim.fn.fnamemodify(buffer_name, ":e")
+    icon = get_icon(buffer_name, ext, { default = true })
+  end
+
   local name =
     truncate_name(
       prefix_text_if(
         prefix_devicon(
-          buffer_name(),
-          get_icon
+          buffer_name,
+          icon
         ),
-        Config.multi_icon,
+        Config.icons.multi,
         buffer_count() > 1
       ),
       Config.max_tabname_width
