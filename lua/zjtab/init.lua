@@ -1,9 +1,9 @@
 
--- add directory name parsing
---  - replace home with ~
---  - add maximum directory depth
---  - add github detection
---  get rid of race conditions
+-- --- Utilities
+
+local function notify(msg, level)
+  vim.notify("zj-tab.nvim: " .. msg, level, { title = "zj-tab.nvim" })
+end
 
 --- --- Class ---
 
@@ -16,23 +16,21 @@ end
 --- --- Config ---
 
 local DEFAULTS = {
-  tab = {
-    max_width = 20,
-    enable_devicons = true,
-  },
-  icons = {
-    multi_buffer = "",
-    directory = "",
-    default_icon = "",
-  },
-  runtime = {
-    debounce_milliseconds = 20,
-    enable_debug_logs = true,
-  },
-  fallbacks = {
-    restored_tab_name = "Tab",
-    buffer_name = "[No Name]",
-  }
+  max_width = 40,
+  max_directories = 5,
+  show_path_for_file = false,
+  show_path_for_directory = false,
+
+  enable_icons = true,
+  multi_buffer_icon = "",
+  directory_icon = "",
+  default_icon = "",
+
+  fallback_original_tab_name = "Tab",
+  fallback_buffer_name = "[No Name]",
+
+  debounce_milliseconds = 20,
+  enable_debug_logs = false,
 }
 
 local Config = class()
@@ -42,10 +40,9 @@ function Config:new()
 end
 
 function Config:merge(opts)
-  if opts then
-    local merged = vim.tbl_deep_extend("force", self, opts)
-    setmetatable(merged, getmetatable(self))
-  end
+  if not opts then return self end
+  local merged = vim.tbl_deep_extend("force", {}, self, opts)
+  for k, v in pairs(merged) do self[k] = v end
   return self
 end
 
@@ -71,8 +68,12 @@ function Zellij:action_async(arguments, options)
   return vim.fn.jobstart(vim.list_extend({ "zellij", "action" }, arguments), options)
 end
 
+function Zellij:rename_tab_async(name)
+  self:action_async({"rename-tab", name})
+end
+
 function Zellij:focused_tab_name()
-  local layout_dump = vim.fn.system({ "zellij", "action", "dump-layout" })
+  local layout_dump = self:action_wait({"dump-layout"})--vim.fn.system({ "zellij", "action", "dump-layout" })
   if not layout_dump or layout_dump == "" then return nil end
   for line in layout_dump:gmatch("[^\r\n]+") do
     if line:find("tab") and line:find("focus%s*=%s*true") then
@@ -84,8 +85,7 @@ end
 
 -- --- Devicons ---
 
-local Devicons = {}
-Devicons.__index = Devicons
+local Devicons = class()
 
 function Devicons:new()
   local ok, api = pcall(require, "nvim-web-devicons")
@@ -96,356 +96,311 @@ function Devicons:available()
   return self.api ~= nil
 end
 
-function Devicons:get_icon(bufname)
+function Devicons:get_icon(buffer_name)
   if not self.api then return nil end
-  local ext = vim.fn.fnamemodify(bufname, ":e")
-  local icon = self.api.get_icon(bufname, ext, { default = true })
+  local tail = vim.fn.fnamemodify(buffer_name, ":t")
+  local extension = vim.fn.fnamemodify(buffer_name, ":e")
+  local icon = self.api.get_icon(tail, extension, { default = true })
   return icon
 end
-
 -- --- NvimTree ---
 
+local NvimTree = class()
+
+function NvimTree:new()
+  local ok, api = pcall(require, "nvim-tree.api")
+  return setmetatable({ api = ok and api or nil }, self)
+end
+
+function NvimTree:available()
+  return self.api ~= nil and self.api.tree.is_visible()
+end
+
+function NvimTree:absolute_path()
+  if not self:available() then return end
+  local node = self.api.tree.get_node_under_cursor()
+  return node and node.absolute_path or nil
+end
+
+function NvimTree:absolute_path_tail()
+  local absolute_path = self:absolute_path()
+  if absolute_path then return vim.fn.fnamemodify(absolute_path, ":t") end
+  return nil
+end
+
 -- --- TabRenamer ---
+
 local TabRenamer = class()
 
-function TabRenamer:new(config, zellij, devicons)
+function TabRenamer:new(config, zellij, devicons, nvimtree)
+  if config.enable_icons and not devicons:available() then
+    notify(
+      "Could not find nvim-web-devicons plugin. Falling back to the default icon.",
+      vim.log.levels.WARN
+    )
+  end
   return setmetatable({
     config = config,
     zellij = zellij,
     devicons = devicons,
+    nvimtree = nvimtree,
     pending = false,
     last_name = nil,
-    original_name = { known = false, name = nil }
+    original_name = nil,
   }, self)
 end
 
-local function truncate(string, max_width)
-  local width = vim.fn.strdisplaywidth(string)
+local function truncate(str, max_width)
+  local width = vim.fn.strdisplaywidth(str)
   if width <= max_width then
-    return string
+    return str
   else
-    return vim.fn.strcharpart(string, 0, max_width - 1) .. "…"
+    return vim.fn.strcharpart(str, 0, max_width - 1) .. "…"
   end
 end
 
-local function buffer_count()
-  return #vim.fn.getbufinfo({ buflisted = 1 })
+local function replace_home_with_tilde(path)
+  if not path or path == "" then return "" end
+  local home = vim.fn.expand("~")
+  return path:gsub("^" .. vim.pesc(home), "~")
 end
 
-function TabRenamer:compute_name_from_buffer()
-  local buffer_filetype = vim.bo.filetype
-  local icon, name
+local function truncate_directories(path, max_directories)
+  if not path or path == "" then return "" end
 
-  if buffer_filetype == "netrw" then
-    icon = self.config.icons.directory
-    name = vim.b.netrw_curdir or self.config.fallbacks.buffer_name
-  elseif buffer_filetype == "NvimTree" then
-    icon = self.config.icons.directory
-    name = self.config.fallback.buffername
-  else
-    name = vim.fn.expand("%:t")
-    if name == "" then name = self.config.fallbacks.buffer_name end
-    -- pick up here
+  local parts = {}
+  for dir in path:gmatch("[^/]+") do
+    table.insert(parts, dir)
   end
-end
 
--- --- old state ---
+  local total = #parts
+  local truncated = false
 
-local state = {
-  zj_tab = {
-    autocommand_group = nil,
-  },
-  tab = {
-    pending = false,
-    last_set_tab_name = nil,
-    original_tab_name = { known = false, name = config.fallbacks.restored_tab_name },
-    rename_tab_function = nil,
-  },
-  loaded_plugins = {
-    devicons = nil,
-    nvim_tree_api = nil,
-  },
-}
-
--- --- Utilities ---
-
-local function merge_into(destination, source)
-  if not source then return destination end
-  for key, value in pairs(source) do
-    if type(value) == "table" and type(destination[key]) == "table" then
-      merge_into(destination[key], value)
-    else
-      destination[key] = value
+  if total > max_directories then
+    local new_parts = {}
+    for i = total - max_directories + 1, total do
+      table.insert(new_parts, parts[i])
     end
+    parts = new_parts
+    truncated = true
   end
-  return destination
+
+  local truncated_path = table.concat(parts, "/")
+
+  if path:sub(1, 1) == "/" and truncated_path:sub(1, 1) ~= "~" then
+    truncated_path = "/" .. truncated_path
+  end
+
+  if truncated then
+    truncated_path = "…/" .. truncated_path
+  end
+
+  return truncated_path
 end
 
-local function notify(message, level)
-  vim.notify("zj-tab.nvim: " .. message, level, { title = "zj-tab.nvim" })
+local function prefix_icon(icon , str)
+  if not icon or icon == "" then return str end
+  return str == "" and icon or icon .. " " .. str
 end
 
-local function debug_log(message)
-  if config.runtime.enable_debug_logs then notify(message, vim.log.levels.DEBUG) end
-end
+local function buffer_count() return #vim.fn.getbufinfo({ buflisted = 1 }) end
+local function current_buffer_type() return vim.bo.filetype end
+local function current_buffer_name() return vim.fn.expand("%:t") end
+local function current_buffer_absolute_path() return vim.fn.expand("%:p") end
 
-local function get_plugin(plugin_name)
-  local ok, plugin = pcall(require, plugin_name)
-  if ok then
-    return plugin
+local function netrw_current_directory()
+  if current_buffer_type() == 'netrw' then
+    return vim.b.netrw_curdir
   else
     return nil
   end
 end
 
--- --- Devicons ---
+function TabRenamer:compute_name_from_buffer()
+  local buffer_filetype = current_buffer_type()
+  local fallback_name = self.config.fallback_buffer_name
+  local fallback_icon = self.config.default_icon
+  local name, icon
 
-local function prefix_devicon(text, icon)
-  if type(text) ~= "string" then
-    debug_log("prefix_devicon: 'text' argument is supposed to be string, is instead " .. type(text))
-    return
-  elseif text == "" then
-    return icon
-  else
-    return icon .. " " .. text
-  end
-end
 
-local function prefix_text_if(text, prefix, condition)
-  if condition then
-    if text == "" then
-      return prefix
-    else
-      return prefix .. " " .. text
+  if buffer_filetype == "netrw" then
+    name = netrw_current_directory()
+    if name and not self.config.show_path_for_directory then
+      name = vim.fn.fnamemodify(name, ":t")
     end
-  else
-    return text
-  end
-end
-
--- --- Tab renaming ---
-
-
-local function get_current_buffer_name()
-  local name = vim.fn.expand("%:t")
-  if name == "" then name = config.fallbacks.buffer_name end
-  return name
-end
-
-local function rename_tab_normal()
-  local name =
-    truncate_string(
-      get_current_buffer_name(),
-      config.tab.max_tab_name_width
-    )
-
-  if name ~= state.tab.last_set_tab_name then
-    state.tab.last_set_tab_name = name
-    zellij.action({ "rename-tab", name })
-  end
-end
-
-local function rename_tab_with_devicons(get_icon)
-  local buffer_type = vim.bo.filetype
-
-  local buffer_name
-  local icon
-
-  -- directory buffers
-  if buffer_type == "netrw" then
-    icon = config.icons.directory
-    buffer_name = vim.b.netrw_curdir
-  elseif buffer_type == "NvimTree" then
-    icon = config.icons.directory
-    local tree_api = state.loaded_plugins.nvim_tree_api
-    if tree_api ~= nil and tree_api.tree.is_visible() then
-      buffer_name = tree_api.tree.get_node_under_cursor().absolute_path
+    icon = self.config.directory_icon
+  elseif buffer_filetype == "NvimTree" then
+    if self.config.show_path_for_directory then
+      name = self.nvimtree:absolute_path()
     else
-      buffer_name = config.fallbacks.buffer_name
+      name = self.nvimtree:absolute_path_tail()
     end
-  -- other buffers
+    icon = self.config.directory_icon
   else
-    buffer_name = get_current_buffer_name()
-    local extension = vim.fn.fnamemodify(buffer_name, ":e")
-    icon = get_icon(buffer_name, extension, { default = true })
+    if self.config.show_path_for_file then
+      name = current_buffer_absolute_path()
+    else
+      name = current_buffer_name()
+    end
+    if self.config.enable_icons then
+      icon = self.devicons:get_icon(name)
+      fallback_icon = self.config.default_icon
+    else
+      icon = self.config.default_icon
+    end
   end
 
-  local name =
-    truncate_string(
-      prefix_text_if(
-        prefix_devicon(
-          buffer_name,
-          icon
-        ),
-        config.icons.multi_buffer,
-        buffer_count() > 1
-      ),
-      config.tab.max_tab_name_width
-    )
+  if icon == self.config.directory_icon or self.config.show_path_for_file then
+    name = truncate_directories(replace_home_with_tilde(name), self.config.max_directories)
+  end
 
-  if name ~= state.tab.last_set_tab_name then
-    state.tab.last_set_tab_name = name
-    zellij.action({ "rename-tab", name })
+  if name == "" then name = nil end
+
+  local tab_name = name or fallback_name
+  local tab_icon = icon or fallback_icon
+  local multi_icon = self.config.multi_buffer_icon
+  local max_width = self.config.max_width
+
+  local title = tab_name
+
+  if self.config.enable_icons then
+    title = prefix_icon(tab_icon, title)
+    if buffer_count() > 1 then title = prefix_icon(multi_icon, title) end
+  end
+  title = truncate(title, max_width)
+
+  return title
+end
+
+function TabRenamer:rename_now()
+  local name = self:compute_name_from_buffer()
+  if name ~= self.last_name then
+    self.last_name = name
+    self.zellij:rename_tab_async(name)
   end
 end
 
-local function build_rename_tab_function(enable_devicons, get_icon)
-  if enable_devicons then
-    return function() rename_tab_with_devicons(get_icon) end
-  else
-    return rename_tab_normal
-  end
-end
-
-local function schedule_rename_tab(force)
-  if state.tab.pending then return end
-  state.tab.pending = true
-  if force then state.tab.last_set_tab_name = nil end
+function TabRenamer:schedule_rename(force_rename)
+  if self.pending then return end
+  self.pending = true
+  if force_rename then self.last_name = nil end
   vim.defer_fn(function()
-    if state.tab.rename_tab_function then state.tab.rename_tab_function() end
-    state.tab.pending = false
-  end, config.runtime.debounce_milliseconds)
+    self:rename_now()
+    self.pending = false
+  end, self.config.debounce_milliseconds)
 end
 
--- --- Plugin API ---
-
-local module = {}
-
-module.enabled = true
-module.config = config
-
-function module.refresh()
-  schedule_rename_tab(true)
-end
-
-function module.teardown(restore)
-  if restore then
-    zellij.action({ "rename-tab", state.tab.original_tab_name.name })
+function TabRenamer:capture_original_name()
+  local name = self.zellij:focused_tab_name()
+  if name == nil then
+    local fallback_name = self.config.fallback_original_tab_name
+    notify(
+      "Could not retrieve original pre-neovim tab name. Defaulting to `" .. fallback_name .. "`.",
+      vim.log.levels.INFO
+    )
+    name = fallback_name
   end
-  if state.zj_tab.autocommand_group then
-    pcall(vim.api.nvim_del_augroup_by_id, state.zj_tab.autocommand_group)
-    state.zj_tab.autocommand_group = nil
-  end
-  state.tab.rename_tab_function = nil
-  state.tab.pending = false
-  state.tab.last_set_tab_name = nil
-  state.tab.original_tab_name = { known = false, name = config.fallbacks.restored_tab_name }
-  state.loaded_plugins = {
-    devicons = nil,
-    nvim_tree_api = nil,
-  }
+  self.original_name = name
 end
 
-function module.toggle()
-  if module.enabled then
-    module.teardown(true)
-    module.enabled = false
-  else
-    module.setup()
-    module.enabled = true
+function TabRenamer:restore_original_name()
+  if self.original_name ~= nil then
+    self.zellij:rename_tab_async(self.original_name)
   end
 end
 
-function module.setup(options)
-  -- delete user commands and autocmd group
-  pcall(vim.api.nvim_del_user_command, "ZJTabRefresh")
-  pcall(vim.api.nvim_del_user_command, "ZJTabToggle")
-  pcall(vim.api.nvim_del_augroup_by_name, "ZJTab")
+-- --- Autocommands ---
 
-  -- combine user config with default config
-  merge_into(config, options)
+local AutoCommands = class()
 
-  -- if not in zellij, the plugin does nothing
-  if not zellij.is_in_zellij() then
+function AutoCommands:new()
+  return setmetatable({ group = nil}, self)
+end
+
+function AutoCommands:create_group(name)
+  self.group = vim.api.nvim_create_augroup(name, { clear = true })
+  return self.group
+end
+
+function AutoCommands:create_command(events, callback, description)
+  vim.api.nvim_create_autocmd(events, {
+    group = self.group,
+    callback = callback,
+    desc = description,
+  })
+end
+
+function AutoCommands:clear()
+  if self.group then pcall(vim.api.nvim_del_augroup_by_id, self.group) end
+  self.group = nil
+end
+
+-- --- Module ---
+
+local M = { enabled = false }
+
+local config = Config:new()
+local zellij = Zellij:new()
+local devicons = Devicons:new()
+local nvimtree = NvimTree:new()
+local renamer = TabRenamer:new(config, zellij, devicons, nvimtree)
+local autocommands = AutoCommands:new()
+
+local function debug_log(message)
+  if config.enable_debug_logs then notify(message, vim.log.levels.DEBUG) end
+end
+
+function M.setup(opts)
+  config:merge(opts)
+
+  if not zellij:available() then
+    debug_log("Not in Zellij; plugin disabled")
     return
   end
 
-  -- get pre-nvim tab name
-  local original_tab_name = zellij.get_focused_tab_name()
-  if original_tab_name == nil then
-    notify(
-      "Could not discover original tab name: will restore to fallback name `"
-        .. config.fallbacks.restored_tab_name .. "`.",
-      vim.log.levels.WARN
-    )
-    state.tab.original_tab_name.name = config.fallbacks.restored_tab_name
-    state.tab.original_tab_name.known = false
-  else
-    state.tab.original_tab_name.name = original_tab_name
-    state.tab.original_tab_name.known = true
-  end
+  renamer:capture_original_name()
 
-  debug_log("module.setup: state.tab.original_tab_name = {"
-        .. "name = `" .. state.tab.original_tab_name.name
-        .. "`, known = " .. tostring(state.tab.original_tab_name.known) .. "}")
+  debug_log("Captured original name: " .. tostring(renamer.original_name))
 
-  state.zj_tab.autocommand_group = vim.api.nvim_create_augroup("ZJTab", { clear = true })
-
-  -- get plugins (if they are not found, they are set to nil)
-  state.loaded_plugins = {
-    devicons = get_plugin("nvim-web-devicons"),
-    nvim_tree_api = get_plugin("nvim-tree.api"),
-  }
-
-  -- configure rename_tab function to use devicons or not
-  if config.tab.enable_devicons then
-    if state.loaded_plugins.devicons == nil then
-      notify(
-        "Could not find nvim-web-devicons plugin. Falling back to the default file icon.",
-        vim.log.levels.WARN
-      )
-      state.tab.rename_tab_function = build_rename_tab_function(
-        true,
-        function(_, _, _) return config.icons.default_icon end
-      )
-    else
-      state.tab.rename_tab_function = build_rename_tab_function(true, state.loaded_plugins.devicons.get_icon)
-    end
-  else
-    state.tab.rename_tab_function = build_rename_tab_function(false)
-  end
-
-  -- rename tab on buffer enter, when file name changes, tab enter, or terminal open
-  vim.api.nvim_create_autocmd({
-    "BufEnter",
-    "BufFilePost",
-    "BufWritePost",
-    "TabEnter",
-    "TermOpen",
-  }, {
-    group = state.zj_tab.autocommand_group,
-    callback = function() schedule_rename_tab(false) end,
-    desc = "zj-tab.nvim: update Zellij tab title"
-  })
-
-  -- force rename tab on focus gained
-  -- (important if other code is modifying zellij tab names in new zellij panes)
-  vim.api.nvim_create_autocmd("FocusGained", {
-    group = state.zj_tab.autocommand_group,
-    callback = function() schedule_rename_tab(true) end,
-    desc = "zj-tab.nvim: refresh tab title on focus",
-  })
-
-  -- restore original tab name on exit
-  vim.api.nvim_create_autocmd("VimLeavePre", {
-    callback = function() module.teardown(true) end,
-    desc = "Restore original Zellij tab name on exit",
-  })
-
-  -- load user commands
-  vim.api.nvim_create_user_command(
-    "ZJTabRefresh",
-    function() module.refresh() end,
-    { desc = "Force refresh of the Zellij tab name", nargs = 0 }
+  autocommands:create_group("ZJTab")
+  autocommands:create_command(
+    {
+      "BufEnter",
+      "BufFilePost",
+      "BufWritePost",
+      "TabEnter",
+      "TermOpen",
+    },
+    function() renamer:schedule_rename(false) end,
+    "zj-tab.nvim: Rename Zellij tab to Neovim buffer name"
+  )
+  autocommands:create_command(
+    "FocusGained",
+    function() renamer:schedule_rename(true) end,
+    "zj-tab.nvim: Refresh Zellij tab name on focus gained"
+  )
+  autocommands:create_command(
+    "VimLeavePre",
+    function() M.teardown() end,
+    "zj-tab.nvim: Deleted autogroup and restoring original tab name"
   )
 
-  vim.api.nvim_create_user_command(
-    "ZJTabToggle",
-    function() module.toggle() end,
-    { desc = "Toggle zj-tab.nvim", nargs = 0 }
-  )
-
-  schedule_rename_tab(true)
+  renamer:schedule_rename(true)
+  M.enabled = true
 end
 
-return module
+function M.refresh() renamer:schedule_rename(true) end
+
+function M.teardown()
+  renamer:restore_original_name()
+  autocommands:clear()
+  M.enabled = false
+end
+
+function M.toggle()
+  if M.enabled then M.teardown()
+  else M.setup()
+  end
+end
+
+return M
